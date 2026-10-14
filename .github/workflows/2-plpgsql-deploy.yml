@@ -7,6 +7,8 @@ on:
     paths:
       # Only trigger if this exact file is modified
       - 'src/exponential_smoothing_pg.pls'
+  # Allow manual redeploys, e.g. after the schema was recreated
+  workflow_dispatch:
 
 jobs:
   deploy-procedure:
@@ -21,5 +23,6 @@ jobs:
 
       - name: Deploy PL/pgSQL Script
         run: |
-          # Explicitly execute only this specific file
-          psql "${{ secrets.SUPABASE_PSQL_URL }}" -f src/exponential_smoothing_pg.pls
+          # Explicitly execute only this specific file.
+          # ON_ERROR_STOP makes psql exit non-zero on SQL errors, so a failed deploy fails the job.
+          psql "${{ secrets.SUPABASE_PSQL_URL }}" -v ON_ERROR_STOP=1 -f src/exponential_smoothing_pg.pls

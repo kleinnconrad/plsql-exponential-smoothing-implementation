@@ -45,5 +45,7 @@ docker run --rm \
   -url="${{ secrets.SUPABASE_JDBC_URL }}" \
   -user="${{ secrets.SUPABASE_DB_USER }}" \
   -password="${{ secrets.SUPABASE_DB_PASSWORD }}" \
-  -locations=filesystem:/flyway/sql \
   migrate
+```
+
+No `-locations` flag is needed: the Flyway image looks for migrations in `/flyway/sql` by default, which is exactly where this directory is mounted.

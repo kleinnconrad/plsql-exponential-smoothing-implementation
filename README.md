@@ -15,16 +15,20 @@
   * [Required GitHub Secrets](#required-github-secrets)
 * [Exponential Smoothing Formula](#exponential-smoothing-formula)
   * [The Formula](#the-formula)
+  * [The Formula as Implemented](#the-formula-as-implemented)
+  * [Curator's Notes (Known Quirks)](#curators-notes-known-quirks)
   * [Usage](#usage)
 
 
 # PL/pgSQL Exponential Smoothing
 
-This repository provides a handmade PL/pgSQL procedure for calculating simple exponential smoothing directly within a PostgreSQL Database (hosted on Supabase). It is designed for time-series forecasting and trend analysis, applying exponentially diminishing or growing weights to older observations.
+This repository provides a handmade PL/pgSQL procedure for calculating simple exponential smoothing directly within a PostgreSQL Database (hosted on Supabase). It is meant for smoothing a time series and producing one-step-ahead forecasts, applying exponentially decreasing weights to older observations. Simple exponential smoothing models only the level of a series, not its trend, so on trending data the smoothed values lag behind the actuals.
+
+The original, handmade **Oracle PL/SQL** procedure (`src/EXPONENTIAL_SMOOTHING.pls`) is kept as the museum piece; `src/exponential_smoothing_pg.pls` is its PL/pgSQL port. Both are preserved as-is, quirks included (see [Curator's Notes](#curators-notes-known-quirks)).
 
 ## Overview
 
-The procedure `exponential_smoothing` processes sequential data and computes a smoothed forecast using the standard exponential smoothing formula. It calculates the necessary observation windows and iteratively populates a target table with the smoothed values.
+The procedure `exponential_smoothing` processes sequential data and computes smoothed values using the expanded form of the exponential smoothing formula. It calculates 11 sliding observation windows and iteratively populates a target table with one smoothed value per window.
 
 ## Prerequisites
 
@@ -36,8 +40,9 @@ The procedure `exponential_smoothing` processes sequential data and computes a s
 
 Before deploying the procedure, you may need to adjust the following variables within the script to fit your specific dataset:
 
-* `alpha`: The smoothing factor (default is `0.2`). A higher alpha discounts older observations faster. **Note:** Ensure this is defined as `NUMERIC` to prevent decimal truncation.
-* The script orders data sequentially by a column named `DATUM`. Ensure your source table uses this naming convention or update the script accordingly.
+* `alpha`: The smoothing factor (default is `0.2`). A higher alpha discounts older observations faster. **Note on the data type:** in PostgreSQL, `NUMERIC` and `DECIMAL` are the same arbitrary-precision type, so `0.2` is stored exactly. In Oracle PL/SQL, `DECIMAL` and `NUMERIC` are subtypes of `NUMBER(38,0)` and round `0.2` to `0`, so a fractional alpha must be declared as plain `NUMBER` there.
+* The script reads `analytics.source_table`, sums `KUENDIGER` per `DATUM` and orders the series by `DATUM`. Ensure your source table uses these names or update the script accordingly.
+* The windowing is hardcoded around the number `10` (`FOR i IN 0..10`, window end `max_k - (10-i)`), so the source needs more than 10 distinct dates. With 10 or fewer, every window is empty and the procedure inserts `NULL`s.
 
 
 # Database Infrastructure & CI/CD
@@ -48,16 +53,16 @@ This project uses an automated Infrastructure-as-Code (IaC) and Continuous Integ
 
 Initially, this project targeted the Oracle Cloud Always Free tier. However, due to notoriously strict and opaque automated account creation blocks on Oracle Cloud Infrastructure (OCI), securing a stable, permanent free database for CI/CD became unfeasible. 
 
-**Supabase**, a fully managed open-source alternative built on top of **PostgreSQL**, was chosen as the replacement. PostgreSQL features its own procedural language (**PL/pgSQL**) that was explicitly designed to mirror the syntax, structure, and capabilities of Oracle's PL/SQL. This allowed for an almost 1:1 translation of the mathematical logic while gaining a modern, developer-friendly cloud environment.
+**Supabase**, a fully managed open-source alternative built on top of **PostgreSQL**, was chosen as the replacement. PostgreSQL features its own procedural language (**PL/pgSQL**) that was closely modelled on the syntax and block structure of Oracle's PL/SQL. This allowed for an almost 1:1 translation of the mathematical logic while gaining a modern, developer-friendly cloud environment.
 
 ## The IPv6 GitHub Actions Issue & Solution
 
 **The Problem:** Supabase provisions direct database connections using **IPv6** addresses. However, GitHub Actions virtual machines (`ubuntu-latest`) and standard Docker containers currently only support **IPv4** routing. This mismatch causes a `Network is unreachable` error when the pipeline attempts to connect to the database.
 
-**The Solution:** To bridge this gap, we use the **Supabase Connection Pooler (Supavisor)** operating on port `6543`. 
+**The Solution:** To bridge this gap, we use the **Supabase Connection Pooler (Supavisor)**. 
 1. The pooler provides an IPv4-compatible endpoint.
 2. Because the pooler manages thousands of databases, the database username must be updated from `postgres` to include the specific tenant identifier (e.g., `postgres.[project-id]`).
-3. The connection mode must be set to `Session` rather than `Transaction` to support DDL execution in Flyway.
+3. The pooler host offers two modes: **session mode on port `5432`** and **transaction mode on port `6543`**. The examples below use port `6543` (transaction mode), which is enough for these small migrations and the `CREATE OR REPLACE` deployment. Should Flyway run into session-level problems (prepared statements, advisory locks), switch the URLs to port `5432` on the same pooler host to get session mode.
 
 ## Database Migrations with Flyway
 
@@ -76,37 +81,80 @@ The CI/CD flow is intentionally split into two distinct pipelines to separate st
    * **Use Case:** Creating new tables, modifying schemas, or bulk inserting dummy historical data.
 
 2. **Deploy PL/pgSQL Procedure** (`2-plpgsql-deploy.yml`)
-   * **Trigger:** Automatic on `push` to the `main` branch, **only** if `src/exponential_smoothing_pg.pls` is modified.
-   * **Action:** Installs the native PostgreSQL client (`psql`) on the GitHub runner and executes the `.pls` file to compile the logic directly into the `analytics` schema.
+   * **Trigger:** Automatic on `push` to the `main` branch, **only** if `src/exponential_smoothing_pg.pls` is modified. Can also be started manually (`workflow_dispatch`), e.g. to redeploy after the schema was recreated.
+   * **Action:** Installs the native PostgreSQL client (`psql`) on the GitHub runner and executes the `.pls` file to compile the logic directly into the `analytics` schema. `psql` runs with `ON_ERROR_STOP=1`, so a compile error fails the pipeline instead of passing silently.
    * **Use Case:** Updating math formulas, fixing bugs in the procedure, or altering the smoothing window.
 
 ## Required GitHub Secrets
 
 To run the pipelines successfully, the following secrets must be configured in **Settings > Secrets and variables > Actions**:
 
-* `SUPABASE_DB_USER`: Your tenant-identified username (e.g., `postgres.mtwbpvtsrpfknoyhuvks`).
+* `SUPABASE_DB_USER`: Your tenant-identified username (e.g., `postgres.[project-id]`).
 * `SUPABASE_DB_PASSWORD`: Your Supabase database password.
-* `SUPABASE_JDBC_URL`: The Flyway connection string using the IPv4 pooler port (e.g., `jdbc:postgresql://aws-0-eu-west-1.pooler.supabase.com:6543/postgres`).
-* `SUPABASE_PSQL_URL`: The standard connection URI for the `psql` client (e.g., `postgresql://postgres.[project-id]:[password]@aws-0-eu-west-1.pooler.supabase.com:6543/postgres`).
+* `SUPABASE_JDBC_URL`: The Flyway connection string using the IPv4 pooler (e.g., `jdbc:postgresql://aws-0-eu-west-1.pooler.supabase.com:6543/postgres`).
+* `SUPABASE_PSQL_URL`: The standard connection URI for the `psql` client (e.g., `postgresql://postgres.[project-id]:[password]@aws-0-eu-west-1.pooler.supabase.com:6543/postgres`). Special characters in the password must be URL-encoded here.
 
 
 # Exponential Smoothing Formula
 
-The PL/pgSQL script implements the **expanded (or iterative) form** of Simple Exponential Smoothing (SES). Instead of computing the forecast recursively row-by-row ($S_t = \alpha Y_t + (1-\alpha)S_{t-1}$), the script calculates it using a set-based approach over a specific window of data.
+The PL/pgSQL script implements the **expanded (or iterative) form** of Simple Exponential Smoothing (SES). Instead of computing the forecast recursively row-by-row ($S_t = \alpha Y_t + (1-\alpha)S_{t-1}$), the script calculates it using a set-based approach (one weighted `SUM` per window) and repeats it for 11 sliding windows.
 
 ## The Formula
 
-Expressed mathematically, the formula used in your script is:
+Unrolling the recursion over a window of $n$ observations $Y_a, \dots, Y_b$ (with $Y_b$ the newest), started with $S_{a-1} = Y_a$, gives the textbook expanded form:
 
-$$S = \sum_{k} \left[ \alpha (1-\alpha)^k \cdot Y_k \right] + (1-\alpha)^{n+1} \cdot Y_{base}$$
+$$S_b = \sum_{j=0}^{n-1} \alpha (1-\alpha)^j \cdot Y_{b-j} + (1-\alpha)^{n} \cdot Y_a$$
 
 Where:
-* **$S$**: The resulting smoothed value (forecast).
+* **$S_b$**: The smoothed value at the end of the window, which is also the forecast for the next period.
 * **$\alpha$** (`alpha`): The smoothing parameter (set to 0.2 in the script). It dictates how much weight is given to recent versus older observations.
-* **$Y_k$** (`KUENDIGER`): The actual historical observation at a specific time index $k$.
-* **$k$** (`K`): The time index or age of the observation relative to the current calculation window.
-* **$n$** (`ANZ`): The total number of observations in the current sliding window.
-* **$Y_{base}$**: The oldest actual value in the specified time window, acting as the initial anchor or $S_0$
+* **$j$**: The age of an observation within the window (0 for the newest), so weights decrease the older an observation is.
+* **$n$** (`ANZ`): The number of observations in the window.
+* **$Y_a$**: The oldest value in the window, acting as the initial anchor $S_0$.
+
+All weights add up to exactly 1.
+
+## The Formula as Implemented
+
+What the antique script actually computes for each loop index $i = 0, \dots, 10$ is:
+
+$$S_i = \sum_{K=1+i}^{N-10+i} \alpha (1-\alpha)^K \cdot Y_K + (1-\alpha)^{n+1} \cdot Y_{11-i}$$
+
+Where:
+* **$S_i$** (`prog_1`): The value inserted into `analytics.var_x` for iteration $i$.
+* **$Y_K$** (`KUENDIGER`): The sum of the observations for one date.
+* **$K$** (`K`): The **absolute** row number of the date in the whole series, ascending by `DATUM` (oldest = 1). It is neither the age of the observation nor relative to the window.
+* **$N$** (`max_k`): The number of distinct dates in the series.
+* **$n$** (`ANZ`): The number of observations in the window, always $N - 10$.
+* **$Y_{11-i}$**: The anchor value. It is selected with `ORDER BY DATUM DESC` and `rn = max_k - (10-i)`, which resolves to the $(11-i)$-th oldest date.
+
+## Curator's Notes (Known Quirks)
+
+Both procedures are kept as authentic exhibits, which includes their bugs. Running the PL/pgSQL port against the bundled dummy data (20 dates, values between 30 and 60) next to textbook SES over the same windows shows the effect:
+
+| $i$ | Window ($K$) | `prog_1` from the port | Textbook SES, same window | Sum of weights in the port |
+|---:|:---:|---:|---:|---:|
+| 0 | 1..10 | 31.900 | 42.784 | 0.800 |
+| 1 | 2..11 | 27.581 | 45.257 | 0.657 |
+| 2 | 3..12 | 24.020 | 46.387 | 0.543 |
+| 3 | 4..13 | 19.693 | 46.158 | 0.452 |
+| 4 | 5..14 | 16.376 | 48.248 | 0.378 |
+| 5 | 6..15 | 14.313 | 49.106 | 0.320 |
+| 6 | 7..16 | 12.352 | 50.563 | 0.273 |
+| 7 | 8..17 | 10.728 | 53.309 | 0.236 |
+| 8 | 9..18 | 9.947 | 53.769 | 0.206 |
+| 9 | 10..19 | 7.807 | 53.001 | 0.182 |
+| 10 | 11..20 | 6.564 | 54.338 | 0.163 |
+
+1. **Reversed weights.** The exponent is the ascending row number `k`, so the *oldest* observation of a window gets the largest weight and the newest gets the smallest. Textbook SES does the opposite.
+2. **Weights are not re-based per window.** Because `k` is absolute, every step of the sliding window raises all exponents by one. The weights sum to 0.80 in the first window and to 0.16 in the last, so the output sinks towards zero instead of following the data.
+3. **Wandering anchor.** The anchor is picked by *descending* row number and lands on $K = 11 - i$. It walks backwards from $K = 11$ to $K = 1$ while the window walks forward, instead of being the oldest value in the window ($K = 1 + i$). Its exponent `ANZ + 1` is also one higher than needed for the weights to add up to 1.
+4. **Oracle `DECIMAL` truncation.** In the Oracle original, `alpha decimal := 0.2` is rounded to `0`, because PL/SQL defines `DECIMAL` (like `NUMERIC`) as a subtype of `NUMBER(38,0)`. With alpha at 0, every weight in the sum is 0 and the anchor weight is 1, so the Oracle procedure just copies the first 11 raw values in reverse order (53, 48, 50, …, 30 for the dummy data). The port does not have this problem, since an unconstrained `NUMERIC` keeps its decimals in PostgreSQL.
+5. **Ever-growing IDs.** `TRUNCATE` without `RESTART IDENTITY` keeps the identity sequence of `var_x`, so the second run writes IDs 12–22, the third 23–33, and so on.
+6. **No date in the output.** `var_x` stores only `id` and `prog_1`, so the window a value belongs to can only be inferred from the insert order.
+7. **Smaller curiosities.** `PARTITION BY 1` (one partition, same as leaving it out), the declared `i` that the `FOR` loop shadows with its own variable, `ORDER BY` inside inline views (Oracle), dynamic SQL for a static `TRUNCATE`, the series being re-aggregated twice per iteration plus once up front (23 aggregations per call), and the comment "Postgres requires aliases for subqueries", which only holds for PostgreSQL 15 and older.
+
+A restoration in the antique style needs only four changes in the port: use the age `(max_k - (10-i)) - k` as the exponent, use `ANZ` as the anchor exponent, and pick the anchor with `ORDER BY DATUM ASC` and `rn = 1 + i`. With those changes the procedure reproduces the textbook column of the table above exactly.
 
 ## Usage
 
@@ -114,3 +162,8 @@ Where:
 2. To execute the calculation and generate the smoothed data window, run the following command in the Supabase SQL Editor:
    ```sql
    CALL analytics.exponential_smoothing();
+   ```
+3. Read the 11 results (one per window, oldest window first) with:
+   ```sql
+   SELECT id, prog_1 FROM analytics.var_x ORDER BY id;
+   ```
