@@ -30,6 +30,13 @@ The original, handmade **Oracle PL/SQL** procedure (`src/EXPONENTIAL_SMOOTHING.p
 
 The procedure `exponential_smoothing` processes sequential data and computes smoothed values using the expanded form of the exponential smoothing formula. It calculates 11 sliding observation windows and iteratively populates a target table with one smoothed value per window.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/exponential_smoothing_dark.png">
+  <img src="docs/exponential_smoothing_light.png" width="900" alt="The 20 daily KUENDIGER sums as columns above an 11 x 20 grid with one row per loop pass i = 0..10. In each row a 10-date window, shaded by the weight 0.2 x 0.8^K, steps one column to the right, and an orange dot marks the anchor date, which moves from K = 11 down to K = 1. Bars on the right give each prog_1 value, from 31.900 down to 6.564.">
+</picture>
+
+Each loop pass `i` sums the 10-date window `K BETWEEN 1 + i AND max_k - (10-i)` with the weight $\alpha(1-\alpha)^K$ and adds the anchor term $(1-\alpha)^{ANZ+1} \cdot Y_{11-i}$; the result `prog_1` is inserted into `analytics.var_x`. All numbers are computed from the dummy data in `sql/` by `scripts/viz.py` (`pip install -r scripts/requirements.txt`, then `python3 scripts/viz.py`).
+
 ## Prerequisites
 
 * **PostgreSQL Database:** The script is written in PostgreSQL's native procedural language (PL/pgSQL).
